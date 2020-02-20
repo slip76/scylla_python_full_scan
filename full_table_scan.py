@@ -1,15 +1,14 @@
+#!/usr/bin/env python3
 """ Based on https://www.scylladb.com/2017/02/13/efficient-full-table-scans-with-scylla-1-6/
-and https://chriskiehl.com/article/parallelism-in-one-line """
+    and https://www.datastax.com/blog/2015/06/datastax-python-driver-multiprocessing-example-improved-bulk-data-throughput """
 
 import argparse
-import contextvars
-import os
-# import time
+import itertools
+import time
 from cassandra.cluster import Cluster
+from cassandra.concurrent import execute_concurrent_with_args
+from cassandra.query import tuple_factory
 from multiprocessing import Pool
-
-
-verbosity = contextvars.ContextVar('verbosity')
 
 
 def get_n():
@@ -20,11 +19,8 @@ def get_n():
     # TODO (asmirnov): set cores_in_node value based on "num_procs" described here:
     # https://docs.datastax.com/en/opscenter/6.1/api/docs/cluster_info.html#response-node
     cores_in_node = 2
-    if verbosity.get():
-        print("DEBUG: Nodes in cluster:", nodes_in_cluster)
-        print("DEBUG: Cores in node:", cores_in_node)
     n = nodes_in_cluster * cores_in_node * 3
-    # Calculate larger number M:
+
     return n
 
 
@@ -44,56 +40,49 @@ def get_subranges(numberofpartitions):
         a = b
 
 
-# def handle_results(response, timestamp):
-#     res_cnt = 0
-#     for _ in response:
-#         res_cnt += 1
-#     if verbosity.get():
-#         print("DEBUG (%s, %s): Got %s results" % (os.getpid(), timestamp, res_cnt))
+class QueryManager(object):
+    concurrency = 100
+
+    def __init__(self, cluster, process_count=None):
+        self.pool = Pool(processes=process_count, initializer=self._setup, initargs=(cluster,))
+
+    @classmethod
+    def _setup(cls, cluster):
+        cls.session = cluster.connect('test_keyspace2')
+        cls.session.row_factory = tuple_factory
+        cls.prepared = cls.session.prepare(
+            'SELECT token(id), id, ck, v1, v2 FROM example WHERE token(id) >= ? AND token(id) <= ?')
+
+    def close_pool(self):
+        self.pool.close()
+        self.pool.join()
+
+    def get_results(self, params):
+        params = list(params)
+        results = self.pool.map(_multiprocess_get, (params[n:n + self.concurrency] for n in range(0, len(params), self.concurrency)))
+        return list(itertools.chain(*results))
+
+    @classmethod
+    def _results_from_concurrent(cls, params):
+        return [len(results) for results in execute_concurrent_with_args(cls.session, cls.prepared, params)]
 
 
-def get_data(subrange):
-    cluster = Cluster(['127.0.0.1', ], port=9042)
-    session = cluster.connect('test_keyspace')
-    query = """SELECT token(id), id, ck, v1, v2 FROM example WHERE token(id) >= ? AND token(id) <= ?"""
-    prepared_select = session.prepare(query)
-    if verbosity.get():
-        print("DEBUG (%s): %s %s" % (os.getpid(), query, (subrange[0], subrange[1])))
-
-    resultset = session.execute(prepared_select, (subrange[0], subrange[1]))
-    # future = session.execute_async(prepared_select, (subrange[0], subrange[1]))
-    # future.add_callback(handle_results, time.time())
-    res_cnt = 0
-    for _ in resultset:
-        res_cnt += 1
-    # It's easier to convert into list but it's memory-consuming in case of large resultset:
-    # res_cnt = len(list(resultset))
-    if verbosity.get():
-        print("DEBUG (%s): Got %s results" % (os.getpid(), res_cnt))
-
-    return res_cnt
+def _multiprocess_get(params):
+    return QueryManager._results_from_concurrent(params)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("-n", "--num-queries", help="Number of parallel queries to execute",
-                        type=int, dest="num_q", required=False)
-    parser.add_argument("-d", "--verbosity", help="increase output verbosity", action="store_true")
+    parser.add_argument("-i", "--num-iterations", help="Number of iterations",
+                        type=int, dest="iterations", required=True)
+    parser.add_argument("-p", "--num-processes", help="Number of processes",
+                        type=int, dest="processes", required=False)
     options = parser.parse_args()
-    verbosity.set(options.verbosity)
 
-    if options.num_q:
-        n = options.num_q
-    else:
-        n = get_n()
+    cluster = Cluster(['127.0.0.1', ], port=9042)
+    qm = QueryManager(cluster, options.processes)
 
-    # Client-side parallelism:
-    pool = Pool()  # If you leave it blank, it will default to the number of Cores in your machine.
-
-    # Server-side parallelism:
-    results = pool.map(get_data, get_subranges(n * 100))
-    # close the pool and wait for the work to finish
-    pool.close()
-    pool.join()
-
-    print("Scanned %s rows" % (sum(results), ))
+    start = time.time()
+    rows = qm.get_results(get_subranges(options.iterations))
+    delta = time.time() - start
+    print("%d queries in %.2f seconds (%.2f/s)" % (options.iterations, delta, options.iterations / delta))
